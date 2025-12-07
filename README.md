@@ -26,3 +26,16 @@ Dependencies:
 - **GLAD**
 - **GLM** 
 - **OpenMP**
+
+## Credits & Citations
+
+**1. OpenGL Boilerplate (Window, Context, Shaders):**
+- Derived from [LearnOpenGL.com](https://learnopengl.com/)
+- Uses [GLFW](https://www.glfw.org/) for windowing and [GLAD](https://glad.dav1d.de/) for extension loading.
+
+**2. Mathematical Utilities:**
+- Uses the [GLM (OpenGL Mathematics)](https://github.com/g-truc/glm) library.
+
+**3. Rendering Algorithms:**
+- **CPU Photon Mapping:** Implemented based on *Jensen, H. W. (1996). Global illumination using photon maps.*
+- **GPU Path Tracing:** Standard Monte Carlo integration via OpenGL Compute Shaders.
