@@ -1,0 +1,284 @@
+#version 430 core
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(rgba32f, binding = 0) uniform image2D uAccumImage;
+layout(rgba32f, binding = 1) uniform image2D uOutputImage;
+
+uniform vec2  uResolution;
+uniform vec3  uCamPos;
+uniform vec3  uCamFront;
+uniform vec3  uCamUp;
+uniform int   uFrame;
+uniform int   uSampleCount;
+
+// Random number generator
+uint hash(uint x) {
+    x += (x << 10u);
+    x ^= (x >> 6u);
+    x += (x << 3u);
+    x ^= (x >> 11u);
+    x += (x << 15u);
+    return x;
+}
+
+uint hash(uvec3 v) {
+    return hash(v.x ^ hash(v.y) ^ hash(v.z));
+}
+
+float random(inout uint seed) {
+    seed = hash(seed);
+    return float(seed) / 4294967296.0;
+}
+
+vec3 randomInUnitSphere(inout uint seed) {
+    float z = random(seed) * 2.0 - 1.0;
+    float a = random(seed) * 6.28318530718;
+    float r = sqrt(1.0 - z * z);
+    return vec3(r * cos(a), r * sin(a), z);
+}
+
+vec3 randomInHemisphere(vec3 normal, inout uint seed) {
+    vec3 v = randomInUnitSphere(seed);
+    return dot(v, normal) > 0.0 ? v : -v;
+}
+
+struct Hit {
+    float t;
+    vec3  p;
+    vec3  n;
+    int   mat;
+};
+
+bool intersectSphere(vec3 ro, vec3 rd, vec3 center, float radius, inout Hit hit, int matId) {
+    vec3 oc = ro - center;
+    float a = dot(rd, rd);
+    float b = dot(oc, rd);
+    float c = dot(oc, oc) - radius * radius;
+    float disc = b*b - a*c;
+    if (disc < 0.0) return false;
+
+    float s = sqrt(disc);
+    float t = (-b - s) / a;
+    if (t < 0.001) t = (-b + s) / a;
+    if (t < 0.001 || t >= hit.t) return false;
+
+    hit.t = t;
+    hit.p = ro + rd * t;
+    hit.n = normalize(hit.p - center);
+    hit.mat = matId;
+    return true;
+}
+
+bool intersectPlane(vec3 ro, vec3 rd, vec3 p0, vec3 normal, vec2 bound1, vec2 bound2, inout Hit hit, int matId) {
+    float denom = dot(normal, rd);
+    if (abs(denom) < 0.0001) return false;
+    
+    float t = dot(p0 - ro, normal) / denom;
+    if (t < 0.001 || t >= hit.t) return false;
+    
+    vec3 p = ro + t * rd;
+    
+    // Check bounds based on plane orientation
+    bool inBounds = false;
+    if (abs(normal.y) > 0.5) {
+        // Floor/ceiling - check X and Z
+        inBounds = (p.x >= bound1.x && p.x <= bound1.y && p.z >= bound2.x && p.z <= bound2.y);
+    } else if (abs(normal.x) > 0.5) {
+        // Left/right wall - check Z and Y
+        inBounds = (p.z >= bound1.x && p.z <= bound1.y && p.y >= bound2.x && p.y <= bound2.y);
+    } else if (abs(normal.z) > 0.5) {
+        // Front/back wall - check X and Y
+        inBounds = (p.x >= bound1.x && p.x <= bound1.y && p.y >= bound2.x && p.y <= bound2.y);
+    }
+    
+    if (!inBounds) return false;
+    
+    hit.t = t;
+    hit.p = p;
+    hit.n = normal;
+    hit.mat = matId;
+    return true;
+}
+
+bool intersectBox(vec3 ro, vec3 rd, inout Hit hit) {
+    bool hitAny = false;
+    
+    // Floor (y=0) - white
+    if (intersectPlane(ro, rd, vec3(0,0,0), vec3(0,1,0), vec2(0, 552.8), vec2(0, 559.2), hit, 0))
+        hitAny = true;
+    
+    // Ceiling (y=548.8) - white
+    if (intersectPlane(ro, rd, vec3(0,548.8,0), vec3(0,-1,0), vec2(0, 552.8), vec2(0, 559.2), hit, 0))
+        hitAny = true;
+    
+    // Back wall (z=559.2) - white
+    if (intersectPlane(ro, rd, vec3(0,0,559.2), vec3(0,0,-1), vec2(0, 552.8), vec2(0, 548.8), hit, 0))
+        hitAny = true;
+    
+    // Left wall (x=552.8) - red (material 3)
+    if (intersectPlane(ro, rd, vec3(552.8,0,0), vec3(-1,0,0), vec2(0, 559.2), vec2(0, 548.8), hit, 3))
+        hitAny = true;
+    
+    // Right wall (x=0) - green (material 4)
+    if (intersectPlane(ro, rd, vec3(0,0,0), vec3(1,0,0), vec2(0, 559.2), vec2(0, 548.8), hit, 4))
+        hitAny = true;
+    
+    // Light (ceiling) - emissive (material 5)
+    float lightY = 548.7;
+    if (intersectPlane(ro, rd, vec3(278,lightY,279.5), vec3(0,-1,0), vec2(213, 343), vec2(227, 332), hit, 5))
+        hitAny = true;
+    
+    return hitAny;
+}
+
+vec3 getMaterialColor(int mat, vec3 n) {
+    if (mat == 0) return vec3(0.73);           // White
+    if (mat == 3) return vec3(0.65, 0.05, 0.05); // Red
+    if (mat == 4) return vec3(0.12, 0.45, 0.15); // Green
+    if (mat == 5) return vec3(15.0, 15.0, 15.0); // Light (emissive)
+    return vec3(1.0);
+}
+
+// Schlick's approximation for Fresnel
+float schlick(float cosine, float ior) {
+    float r0 = (1.0 - ior) / (1.0 + ior);
+    r0 = r0 * r0;
+    return r0 + (1.0 - r0) * pow(1.0 - cosine, 5.0);
+}
+
+vec3 refract(vec3 v, vec3 n, float etai_over_etat) {
+    float cos_theta = min(dot(-v, n), 1.0);
+    vec3 r_out_perp = etai_over_etat * (v + cos_theta * n);
+    vec3 r_out_parallel = -sqrt(abs(1.0 - dot(r_out_perp, r_out_perp))) * n;
+    return r_out_perp + r_out_parallel;
+}
+
+vec3 trace(vec3 ro, vec3 rd, inout uint seed) {
+    vec3 throughput = vec3(1.0);
+    vec3 radiance = vec3(0.0);
+    
+    for (int bounce = 0; bounce < 8; bounce++) {
+        Hit hit;
+        hit.t = 1e30;
+        hit.mat = -1;
+        
+        // Sphere positions
+        vec3 glassCenter = vec3(185, 80, 169);
+        vec3 mirrorCenter = vec3(368, 80, 351);
+        float radius = 80.0;
+        
+        bool hitSphere1 = intersectSphere(ro, rd, glassCenter, radius, hit, 1);  // Glass
+        bool hitSphere2 = intersectSphere(ro, rd, mirrorCenter, radius, hit, 2); // Mirror
+        bool hitBox = intersectBox(ro, rd, hit);
+        
+        if (!hitSphere1 && !hitSphere2 && !hitBox) {
+            // Hit sky - dark blue/black
+            radiance += throughput * vec3(0.02, 0.02, 0.05);
+            break;
+        }
+        
+        // Material 5: Light source (emissive)
+        if (hit.mat == 5) {
+            radiance += throughput * getMaterialColor(5, hit.n);
+            break;
+        }
+        
+        // Material 0, 3, 4: Diffuse (walls)
+        if (hit.mat == 0 || hit.mat == 3 || hit.mat == 4) {
+            vec3 albedo = getMaterialColor(hit.mat, hit.n);
+            
+            // Russian roulette
+            if (bounce > 3) {
+                float p = max(throughput.x, max(throughput.y, throughput.z));
+                if (random(seed) > p) break;
+                throughput /= p;
+            }
+            
+            // Diffuse reflection
+            vec3 target = hit.p + hit.n + randomInUnitSphere(seed);
+            ro = hit.p + hit.n * 0.001;
+            rd = normalize(target - hit.p);
+            throughput *= albedo;
+            continue;
+        }
+        
+        // Material 2: Mirror (perfect reflection)
+        if (hit.mat == 2) {
+            rd = reflect(rd, hit.n);
+            ro = hit.p + hit.n * 0.001;
+            throughput *= 0.98;
+            continue;
+        }
+        
+        // Material 1: Glass (refraction + reflection)
+        if (hit.mat == 1) {
+            float ior = 1.5;
+            bool front_face = dot(rd, hit.n) < 0.0;
+            vec3 outward_normal = front_face ? hit.n : -hit.n;
+            float etai_over_etat = front_face ? (1.0 / ior) : ior;
+            
+            vec3 unit_direction = normalize(rd);
+            float cos_theta = min(dot(-unit_direction, outward_normal), 1.0);
+            float sin_theta = sqrt(1.0 - cos_theta * cos_theta);
+            
+            bool cannot_refract = etai_over_etat * sin_theta > 1.0;
+            float reflectProb = schlick(cos_theta, etai_over_etat);
+            
+            if (cannot_refract || random(seed) < reflectProb) {
+                // Reflect
+                rd = reflect(unit_direction, outward_normal);
+            } else {
+                // Refract
+                rd = refract(unit_direction, outward_normal, etai_over_etat);
+            }
+            
+            ro = hit.p + rd * 0.001;
+            throughput *= vec3(0.99);
+            continue;
+        }
+    }
+    
+    return radiance;
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= int(uResolution.x) || pix.y >= int(uResolution.y)) return;
+    
+    uint seed = hash(uvec3(pix.x, pix.y, uFrame));
+    
+    // Camera setup
+    vec3 right = normalize(cross(uCamFront, uCamUp));
+    vec3 up = cross(right, uCamFront);
+    
+    float fov = radians(39.3);
+    float aspect = uResolution.x / uResolution.y;
+    float h = tan(fov * 0.5);
+    
+    // Ray with jitter for anti-aliasing
+    vec2 uv = (vec2(pix) + vec2(random(seed), random(seed))) / uResolution;
+    vec2 ndc = uv * 2.0 - 1.0;
+    
+    vec3 ro = uCamPos;
+    vec3 rd = normalize(
+        uCamFront + 
+        right * ndc.x * h * aspect + 
+        up * ndc.y * h
+    );
+    
+    // Trace ray
+    vec3 color = trace(ro, rd, seed);
+    
+    // Accumulate
+    if (uFrame == 0) {
+        imageStore(uAccumImage, pix, vec4(color, 1.0));
+    } else {
+        vec4 prev = imageLoad(uAccumImage, pix);
+        vec3 accumulated = prev.rgb + color;
+        imageStore(uAccumImage, pix, vec4(accumulated, 1.0));
+    }
+    
+    // Output averaged result
+    vec3 final_color = imageLoad(uAccumImage, pix).rgb / float(uFrame + 1);
+    imageStore(uOutputImage, pix, vec4(final_color, 1.0));
+}
