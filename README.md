@@ -11,20 +11,18 @@ This project implements two rendering pipelines inside one application:
 
 ##  Build & Run Instructions
 
-### 1. Create a build directory
 ```bash
 mkdir build
 cd build
-```
-2. Configure the project with CMake
-```bash
 cmake ..
-```
-3. Compile
-```bash
 make
-```
-4. Run the renderer
-```bash
 ./renderer
 ```
+
+Dependencies:
+- **C++17**
+- **OpenGL 4.3+**
+- **GLFW**
+- **GLAD**
+- **GLM** 
+- **OpenMP**
